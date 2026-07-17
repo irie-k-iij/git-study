@@ -1,4 +1,4 @@
-name: Issue Auto Response
+name: Issue Auto Triage
 
 on:
   issues:
@@ -10,20 +10,192 @@ permissions:
   issues: write
 
 jobs:
-  respond:
+  triage:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Show issue information
+      - name: Run rule-based triage
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_USER: ${{ github.event.issue.user.login }}
         run: |
-          echo "Issue number: ${{ github.event.issue.number }}"
-          echo "Issue title : ${{ github.event.issue.title }}"
-          echo "Created by  : ${{ github.actor }}"
+          python3 <<'PY'
+          import os
+          from pathlib import Path
 
-      - name: Add automatic comment
+          issue_number = os.environ.get("ISSUE_NUMBER", "")
+          issue_title = os.environ.get("ISSUE_TITLE", "")
+          issue_body = os.environ.get("ISSUE_BODY", "")
+          issue_user = os.environ.get("ISSUE_USER", "")
+
+          # タイトルと本文を結合して判定対象にする
+          text = f"{issue_title}\n{issue_body}".lower()
+
+          results = []
+
+          if "407" in text or "proxy authentication required" in text:
+              results.append({
+                  "category": "プロキシ認証エラー",
+                  "cause": (
+                      "プロキシが認証を要求しています。"
+                      "Kerberos認証、認証ヘッダー、利用ユーザーまたは端末の"
+                      "アクセス条件に問題がある可能性があります。"
+                  ),
+                  "checks": [
+                      "対象時刻のプロキシログで407直後に200が記録されているか",
+                      "端末がKerberosチケットを取得できているか",
+                      "対象URLが認証対象ACLに含まれているか",
+                      "利用ユーザー・端末IP・URLの条件が一致しているか",
+                      "SPNおよびkeytabの設定に問題がないか",
+                  ],
+              })
+
+          if "403" in text or "forbidden" in text or "アクセス拒否" in text:
+              results.append({
+                  "category": "アクセス制御による拒否",
+                  "cause": (
+                      "通信先URL、IPアドレス、カテゴリ、利用者または端末が、"
+                      "許可ルールに一致していない可能性があります。"
+                  ),
+                  "checks": [
+                      "対象URLまたはFQDNが許可リストに登録されているか",
+                      "拒否ルールが許可ルールより先に評価されていないか",
+                      "利用者・端末IP・グループの条件が正しいか",
+                      "ZscalerまたはプロキシのURLカテゴリ判定を確認する",
+                      "対象時刻のログに記録された拒否理由を確認する",
+                  ],
+              })
+
+          if any(word in text for word in [
+              "証明書", "certificate", "ssl error", "tls error",
+              "安全ではありません", "信頼されていません"
+          ]):
+              results.append({
+                  "category": "証明書・SSL/TLSエラー",
+                  "cause": (
+                      "SSL復号後の証明書、証明書チェーン、失効確認、"
+                      "または端末側の信頼済みルート証明書に問題がある可能性があります。"
+                  ),
+                  "checks": [
+                      "ブラウザに表示される証明書の発行者と有効期限を確認する",
+                      "端末に必要なルート証明書・中間CA証明書が存在するか",
+                      "CRL・OCSP・AIAの参照先へ通信できるか",
+                      "SSL復号対象または復号除外対象として正しく判定されているか",
+                      "同一サイトで他端末にも同じ事象が発生するか",
+                  ],
+              })
+
+          if any(word in text for word in [
+              "timeout", "timed out", "タイムアウト",
+              "応答がありません", "接続できません"
+          ]):
+              results.append({
+                  "category": "通信タイムアウト",
+                  "cause": (
+                      "接続先サーバ、DNS、プロキシ経路、上位サービス、"
+                      "または通信タイムアウト値に問題がある可能性があります。"
+                  ),
+                  "checks": [
+                      "対象時刻のプロキシログでレスポンスタイムを確認する",
+                      "DNS名前解決が成功しているか",
+                      "プロキシから接続先のTCP/443へ接続できるか",
+                      "上位プロキシまたはクラウドサービス側で遅延がないか",
+                      "connect_timeoutおよびread_timeoutの設定値を確認する",
+                  ],
+              })
+
+          if any(code in text for code in ["502", "503", "bad gateway", "service unavailable"]):
+              results.append({
+                  "category": "上位サーバ・ゲートウェイエラー",
+                  "cause": (
+                      "上位プロキシ、クラウドサービス、または接続先Webサーバが"
+                      "正常な応答を返せなかった可能性があります。"
+                  ),
+                  "checks": [
+                      "同時刻に他のURLでも502または503が発生していないか",
+                      "上位プロキシへの接続状態を確認する",
+                      "接続先Webサーバの稼働状況を確認する",
+                      "再試行時に正常応答へ戻るか確認する",
+                      "プロキシログのhierarchy codeとエラー詳細を確認する",
+                  ],
+              })
+
+          if any(word in text for word in [
+              "dns", "名前解決", "name resolution",
+              "name not resolved", "could not resolve"
+          ]):
+              results.append({
+                  "category": "DNS名前解決エラー",
+                  "cause": (
+                      "端末またはプロキシが対象ホスト名をIPアドレスへ"
+                      "正常に変換できていない可能性があります。"
+                  ),
+                  "checks": [
+                      "nslookupまたはdigで対象FQDNを名前解決できるか",
+                      "端末とプロキシで名前解決結果が異ならないか",
+                      "DNSサーバへの通信が正常か",
+                      "対象FQDNの入力誤りや廃止がないか",
+                  ],
+              })
+
+          # 何のルールにも一致しなかった場合
+          if not results:
+              results.append({
+                  "category": "分類不能",
+                  "cause": (
+                      "登録内容だけでは既定の障害パターンに分類できませんでした。"
+                  ),
+                  "checks": [
+                      "HTTPステータスコードを確認する",
+                      "対象URLまたはFQDNを確認する",
+                      "正確な発生日時を確認する",
+                      "エラーメッセージまたは画面キャプチャを確認する",
+                      "同一事象が発生する端末・利用者の範囲を確認する",
+                  ],
+              })
+
+          lines = [
+              "## 自動一次切り分け結果",
+              "",
+              f"- **Issue番号**：#{issue_number}",
+              f"- **タイトル**：{issue_title}",
+              f"- **登録者**：{issue_user}",
+              "",
+          ]
+
+          for index, result in enumerate(results, start=1):
+              lines.extend([
+                  f"### 判定{index}：{result['category']}",
+                  "",
+                  f"**推定内容**  ",
+                  result["cause"],
+                  "",
+                  "**確認項目**",
+              ])
+
+              for check in result["checks"]:
+                  lines.append(f"- {check}")
+
+              lines.append("")
+
+          lines.extend([
+              "### 注意",
+              "",
+              "このコメントはキーワードによるルールベース判定です。"
+              "実際の原因を確定するものではありません。",
+          ])
+
+          Path("/tmp/comment.md").write_text(
+              "\n".join(lines),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Post triage result
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_URL: ${{ github.event.issue.html_url }}
         run: |
-          gh issue comment "$ISSUE_URL" \
-            --body "お問い合わせを受け付けました。運用担当者が内容を確認します。"
+          gh issue comment "$ISSUE_URL" --body-file /tmp/comment.md
