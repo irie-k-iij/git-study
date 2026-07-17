@@ -1,0 +1,17 @@
+name: Issue Created
+
+on:
+  issues:
+    types:
+      - opened
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Hello
+        run: |
+          echo "Issue Created!"
+          echo "Title: ${{ github.event.issue.title }}"
+          echo "User : ${{ github.actor }}"
